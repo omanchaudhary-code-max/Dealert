@@ -35,7 +35,7 @@ const deals = [
   {
     id: 3,
     name: "Sony WH-1000XM5 Headphones",
-    platform: "HamroBazar",
+    platform: "Daraz",
     currentPrice: 42999,
     originalPrice: 45999,
     discount: 7,
@@ -71,7 +71,7 @@ const deals = [
   {
     id: 6,
     name: "Prestige Pressure Cooker 5L",
-    platform: "HamroBazar",
+    platform: "Daraz",
     currentPrice: 3499,
     originalPrice: 4999,
     discount: 30,

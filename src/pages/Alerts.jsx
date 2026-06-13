@@ -30,7 +30,7 @@ const initialAlerts = [
   {
     id: 3,
     product: "Sony WH-1000XM5 Headphones",
-    platform: "HamroBazar",
+    platform: "Daraz",
     currentPrice: 39999,
     targetPrice: 42999,
     image: "🎧",

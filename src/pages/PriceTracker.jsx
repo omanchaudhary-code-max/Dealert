@@ -42,7 +42,7 @@ const sampleProducts = [
   {
     id: 3,
     name: "Sony WH-1000XM5 Headphones",
-    platform: "HamroBazar",
+    platform: "Daraz",
     currentPrice: 42999,
     originalPrice: 45999,
     lowestPrice: 39999,
@@ -80,7 +80,7 @@ export default function PriceTracker() {
               <Input
                 value={searchUrl}
                 onChange={(e) => setSearchUrl(e.target.value)}
-                placeholder="Paste product URL from Daraz, HamroBazar..."
+                placeholder="Paste product URL from Daraz..."
                 className="pl-11 h-12 bg-white border-0 rounded-xl"
               />
             </div>

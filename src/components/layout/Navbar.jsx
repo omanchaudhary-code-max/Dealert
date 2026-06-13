@@ -35,13 +35,24 @@ export default function Navbar() {
                     variant={isActive ? "default" : "ghost"}
                     size="sm"
                     className={`font-medium text-sm ${isActive ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}>
-                    
                     <link.icon className="w-4 h-4 mr-1.5" />
                     {link.label}
                   </Button>
                 </Link>);
-
             })}
+          </div>
+
+          <div className="hidden md:flex items-center gap-2">
+            <Link to="/login">
+              <Button variant="ghost" size="sm" className="font-medium text-muted-foreground hover:text-foreground">
+                Log In
+              </Button>
+            </Link>
+            <Link to="/register">
+              <Button size="sm" className="font-medium bg-[#10B981] hover:bg-[#059669] text-white rounded-lg px-4">
+                Sign Up
+              </Button>
+            </Link>
           </div>
 
           <Button
@@ -85,6 +96,14 @@ export default function Navbar() {
                   </Link>);
 
             })}
+              <div className="flex gap-2 px-3 pt-2 pb-1">
+                <Link to="/login" className="flex-1" onClick={() => setMobileOpen(false)}>
+                  <Button variant="outline" size="sm" className="w-full font-medium">Log In</Button>
+                </Link>
+                <Link to="/register" className="flex-1" onClick={() => setMobileOpen(false)}>
+                  <Button size="sm" className="w-full font-medium bg-[#10B981] hover:bg-[#059669] text-white">Sign Up</Button>
+                </Link>
+              </div>
             </div>
           </motion.div>
         }
