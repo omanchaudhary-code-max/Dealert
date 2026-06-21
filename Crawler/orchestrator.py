@@ -1,16 +1,3 @@
-"""
-orchestrator.py
----------------
-Runs a complete daily crawl cycle:
-  1. Open the crawler
-  2. For each configured category, crawl products
-  3. Save each product to MongoDB IMMEDIATELY as it is scraped
-     (so partial data is never lost even if the crawl crashes mid-category)
-  4. Log the full result with per-category breakdown
-  5. Close everything cleanly
-
-Called by the scheduler (scheduler.py) or directly for one-off runs.
-"""
 
 import logging
 import os

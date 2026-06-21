@@ -1,14 +1,3 @@
-"""
-storage.py
-----------
-MongoDB storage layer for SPTDAS crawler.
-
-Collections managed:
-  products        — master product registry (one doc per item_id)
-  price_history   — timestamped price entry per crawl cycle per product
-  crawl_logs      — one doc per full crawl run (for admin dashboard)
-  errors          — failed crawl attempts for debugging
-"""
 
 import logging
 from datetime import datetime, timezone

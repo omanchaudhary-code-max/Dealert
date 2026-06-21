@@ -1,19 +1,3 @@
-"""
-daraz_crawler.py
-----------------
-ToS-compliant Daraz Nepal product price crawler.
-
-Compliance checklist (daraz.com.np robots.txt + ToS):
-  ✅ Only crawls product listing & detail pages — NOT /checkout/, /customer/,
-     /cart/, /catalog/, /wangpu/, /shop/*.htm (all disallowed in robots.txt)
-  ✅ Randomised delay between requests (DELAY_MIN–DELAY_MAX seconds)
-  ✅ Does NOT scrape personal/user data — only public product price fields
-  ✅ Does NOT bypass any login wall, CAPTCHA, or authentication
-  ✅ Stores only price numerals + product identifiers (no copyrighted descriptions
-     or images — just enough for price history analysis)
-  ✅ Runs at low frequency (once daily, low product count per category)
-  ✅ Non-commercial academic project — not reselling data
-"""
 
 import logging
 import random
@@ -25,6 +9,7 @@ from typing import Optional
 from selenium import webdriver
 from selenium.common.exceptions import (
     NoSuchElementException,
+    StaleElementReferenceException,
     TimeoutException,
     WebDriverException,
 )
@@ -63,6 +48,28 @@ SELECTORS = {
 # Retry config
 MAX_RETRIES   = 3   # attempts per product before giving up
 RETRY_BACKOFF = 5   # extra seconds added per retry attempt
+
+# Some categories don't have a dedicated path-based listing page on Daraz
+# (e.g. https://www.daraz.com.np/books/ returns nothing) — they only
+# surface through Daraz's internal search/catalog endpoint instead.
+# Maps our category label -> the search query that finds it.
+SEARCH_BASED_CATEGORIES = {
+    "books": "book",
+    "kitchen-appliances": "kitchen",
+    "cameras": "camera",
+}
+
+
+def build_listing_url(category: str) -> str:
+    """
+    Build the correct first-page listing URL for a category.
+    Most categories are path-based (daraz.com.np/{slug}/). A few only
+    exist as a search/catalog query — see SEARCH_BASED_CATEGORIES above.
+    """
+    if category in SEARCH_BASED_CATEGORIES:
+        query = SEARCH_BASED_CATEGORIES[category]
+        return f"{DARAZ_BASE}/catalog/?q={query}"
+    return f"{DARAZ_BASE}/{category}/"
 
 
 class DarazCrawler:
@@ -280,57 +287,97 @@ class DarazCrawler:
 
     # ──────────────────────────── Category listing ──────────────────────────────
 
+    def _extract_links_from_current_page(self, links: list[str], max_products: int) -> None:
+        """Read product cards currently in the DOM and append new links in-place."""
+        cards = self.driver.find_elements(By.CSS_SELECTOR, SELECTORS["product_cards"])
+        for card in cards:
+            if len(links) >= max_products:
+                break
+            try:
+                anchor = card.find_element(By.CSS_SELECTOR, SELECTORS["card_link"])
+                href = anchor.get_attribute("href")
+                if href and "daraz.com.np/products/" in href:
+                    clean = href.split("?")[0].split("#")[0]
+                    if clean not in links:
+                        links.append(clean)
+            except NoSuchElementException:
+                continue
+
     def _collect_product_links(self, category: str, max_products: int) -> list[str]:
         """
         Walk Daraz category listing pages and collect product detail URLs.
         Stops when max_products links are collected or no more pages exist.
+
+        IMPORTANT: Daraz's listing page is a client-rendered SPA — pagination
+        state lives in JavaScript, not the URL. Re-navigating to `?page=N`
+        with driver.get() just reloads page 1's content again, which silently
+        caps every category at one page worth of products. We instead click
+        the actual "Next" pagination button and wait for the old cards to go
+        stale before reading the new ones.
         """
-        links       = []
-        page        = 1
-        listing_url = f"{DARAZ_BASE}/{category}/"
+        links = []
+        page = 1
+        listing_url = build_listing_url(category)
+
+        try:
+            self.driver.get(listing_url)
+            self._wait_for(SELECTORS["product_cards"], timeout=20)
+            self._polite_wait()
+        except TimeoutException:
+            logger.warning(f"Timeout on listing page 1 for /{category}/, stopping category.")
+            return links
+        except WebDriverException as e:
+            logger.error(f"WebDriver error loading {listing_url}: {e}")
+            return links
 
         while len(links) < max_products:
-            url = listing_url if page == 1 else f"{listing_url}?page={page}"
-            logger.info(f"Listing page {page}: {url}")
+            logger.info(f"Listing page {page} for /{category}/ — {len(links)} links so far")
+
+            cards_before = self.driver.find_elements(By.CSS_SELECTOR, SELECTORS["product_cards"])
+            if not cards_before:
+                logger.info(f"No products on page {page}, stopping.")
+                break
+
+            self._extract_links_from_current_page(links, max_products)
+
+            if len(links) >= max_products:
+                break
+
+            # Find the "Next" button — absence means we're on the last page.
+            try:
+                next_btn = self.driver.find_element(By.CSS_SELECTOR, SELECTORS["next_page"])
+            except NoSuchElementException:
+                logger.info("Last page reached.")
+                break
 
             try:
-                self.driver.get(url)
-                self._wait_for(SELECTORS["product_cards"], timeout=20)
-                self._polite_wait()
-
-                cards = self.driver.find_elements(
-                    By.CSS_SELECTOR, SELECTORS["product_cards"]
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center'});", next_btn
                 )
-                if not cards:
-                    logger.info(f"No products on page {page}, stopping.")
-                    break
+                self._polite_wait(extra=0.5)
+                next_btn.click()
+            except WebDriverException as e:
+                logger.warning(f"Click on next-page button failed: {e}")
+                break
 
-                for card in cards:
-                    if len(links) >= max_products:
-                        break
-                    try:
-                        anchor = card.find_element(By.CSS_SELECTOR, SELECTORS["card_link"])
-                        href = anchor.get_attribute("href")
-                        if href and "daraz.com.np/products/" in href:
-                            clean = href.split("?")[0].split("#")[0]
-                            if clean not in links:
-                                links.append(clean)
-                    except NoSuchElementException:
-                        continue
+            page += 1
 
-                try:
-                    self.driver.find_element(By.CSS_SELECTOR, SELECTORS["next_page"])
-                    page += 1
-                except NoSuchElementException:
-                    logger.info("Last page reached.")
-                    break
-
-            except TimeoutException:
-                logger.warning(f"Timeout on listing page {page}, stopping category.")
+            # Wait for the page to actually change: the first card from the
+            # previous page should go stale once the SPA swaps in new content.
+            try:
+                first_card_before = cards_before[0]
+                WebDriverWait(self.driver, 15).until(EC.staleness_of(first_card_before))
+                self._wait_for(SELECTORS["product_cards"], timeout=20)
+            except (TimeoutException, StaleElementReferenceException):
+                logger.warning(
+                    f"Timeout waiting for page {page} content to load on /{category}/, stopping."
+                )
                 break
             except WebDriverException as e:
-                logger.error(f"WebDriver error on listing: {e}")
+                logger.error(f"WebDriver error advancing to page {page}: {e}")
                 break
+
+            self._polite_wait()
 
         logger.info(f"Collected {len(links)} links from /{category}/")
         return links
