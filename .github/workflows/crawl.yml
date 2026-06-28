@@ -53,8 +53,7 @@ jobs:
           PROJECT_END_DATE: 2026-07-30
           CRAWL_MODE: discovery
           LOG_LEVEL: INFO
-          # CHROME_VER is set automatically by the Install Chrome step above
-          # CHROME_BINARY not needed — google-chrome is on PATH in ubuntu-latest
+        run: python run_now.py
 
       - name: Upload crawler log
         if: always()
