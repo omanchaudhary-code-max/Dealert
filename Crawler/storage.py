@@ -1,10 +1,8 @@
-
 import logging
 from datetime import datetime, timezone
 from typing import Optional
 
 from pymongo import MongoClient, ASCENDING, DESCENDING
-from pymongo.collection import Collection
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 logger = logging.getLogger(__name__)
@@ -32,7 +30,6 @@ class SPTDASStorage:
     def connect(self):
         logger.info(f"Connecting to MongoDB: {self.uri} / {self.db_name}")
         self._client = MongoClient(self.uri, serverSelectionTimeoutMS=5000)
-        # Ping to confirm connection
         self._client.admin.command("ping")
         self._db = self._client[self.db_name]
         self._ensure_indexes()
@@ -54,9 +51,7 @@ class SPTDASStorage:
         self._db.products.create_index(
             [("item_id", ASCENDING)], unique=True, name="idx_item_id"
         )
-        # price_history: dedup index — one price entry per product per crawl window (1 hour)
-        # We do NOT use a strict unique index here because price genuinely can be
-        # the same across days — we rely on crawl_run_id to deduplicate within a run.
+        # price_history: dedup index
         self._db.price_history.create_index(
             [("item_id", ASCENDING), ("scraped_at", DESCENDING)],
             name="idx_item_scraped",
@@ -100,7 +95,6 @@ class SPTDASStorage:
         return run_id
 
     def finish_crawl_run(self, run_id: str, stats: dict):
-        """Update the crawl log when the run completes."""
         from bson import ObjectId
         self._db.crawl_logs.update_one(
             {"_id": ObjectId(run_id)},
@@ -137,7 +131,7 @@ class SPTDASStorage:
           1. Upsert into `products` collection (create or update metadata)
           2. Insert a new timestamped entry into `price_history`
              — but ONLY if no entry for this item_id exists within the same
-               crawl window (prevents duplication if the crawler retries)
+               crawl run (prevents duplication if the crawler retries)
 
         Returns stats dict: {new, updated, skipped, errors}
         """
@@ -155,17 +149,16 @@ class SPTDASStorage:
                 existing = self._db.products.find_one({"item_id": item_id})
 
                 product_doc = {
-                    "item_id": item_id,
-                    "title": product.get("title"),
-                    "url": product.get("url"),
-                    "category": product.get("category"),
-                    "seller_name": product.get("seller_name"),
-                    "last_seen": product.get("scraped_at"),
-                    "last_price": product.get("current_price"),
-                    # ── NEW FIELDS ──────────────────────────────────────────
-                    "image_url": product.get("image_url"),
+                    "item_id":       item_id,
+                    "title":         product.get("title"),
+                    "url":           product.get("url"),
+                    "category":      product.get("category"),
+                    "seller_name":   product.get("seller_name"),
+                    "last_seen":     product.get("scraped_at"),
+                    "last_price":    product.get("current_price"),
+                    "image_url":     product.get("image_url"),
                     "image_verified": product.get("image_verified", False),
-                    "is_delisted": product.get("is_delisted", False),
+                    "is_delisted":   product.get("is_delisted", False),
                 }
 
                 if existing:
@@ -180,8 +173,6 @@ class SPTDASStorage:
                     stats["new"] += 1
 
                 # ── 2. Deduplicate within crawl run ──────────────────────────
-                # If we already have an entry for this item_id from THIS run,
-                # skip (guards against crawler retries in the same session).
                 already_in_run = self._db.price_history.find_one(
                     {"item_id": item_id, "crawl_run_id": crawl_run_id}
                 )
@@ -192,15 +183,14 @@ class SPTDASStorage:
 
                 # ── 3. Insert price history entry ────────────────────────────
                 history_doc = {
-                    "item_id": item_id,
-                    "crawl_run_id": crawl_run_id,
-                    "scraped_at": product.get("scraped_at"),
-                    "current_price": product.get("current_price"),
+                    "item_id":        item_id,
+                    "crawl_run_id":   crawl_run_id,
+                    "scraped_at":     product.get("scraped_at"),
+                    "current_price":  product.get("current_price"),
                     "original_price": product.get("original_price"),
                     "is_promotional": product.get("is_promotional", False),
-                    "category": product.get("category"),
-                    # ── NEW FIELD ───────────────────────────────────────────
-                    "is_delisted": product.get("is_delisted", False),
+                    "category":       product.get("category"),
+                    "is_delisted":    product.get("is_delisted", False),
                 }
                 self._db.price_history.insert_one(history_doc)
 
@@ -221,14 +211,31 @@ class SPTDASStorage:
             self._db.errors.insert_one(
                 {
                     "crawl_run_id": crawl_run_id,
-                    "category": category,
-                    "url": url,
-                    "reason": reason,
-                    "logged_at": datetime.now(timezone.utc),
+                    "category":     category,
+                    "url":          url,
+                    "reason":       reason,
+                    "logged_at":    datetime.now(timezone.utc),
                 }
             )
         except PyMongoError:
-            pass  # Don't let error logging crash the crawler
+            pass
+
+    # ──────────────────────────── Tracking mode read ────────────────────────────
+
+    def get_all_tracked_urls(self) -> list[dict]:
+        """
+        TRACKING MODE — return url + category for every non-delisted product.
+
+        Called by orchestrator at the start of a tracking-mode run to get the
+        full basket of products to re-scrape. Returns only the fields the
+        crawler needs; _id is excluded.
+        """
+        return list(
+            self._db.products.find(
+                {"is_delisted": {"$ne": True}},
+                {"_id": 0, "item_id": 1, "url": 1, "category": 1},
+            )
+        )
 
     # ──────────────────────────── Read helpers (for deal engine) ────────────────
 

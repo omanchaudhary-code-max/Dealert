@@ -206,9 +206,9 @@ def main():
         args=[scheduler],
         id="daily_daraz_crawl",
         name="Daily Daraz NP price crawl",
-        misfire_grace_time=3600,  # Fire even if up to 1h late
-        coalesce=True,            # Only fire once for multiple missed runs
-        max_instances=1,          # Never overlap two crawls
+        misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
     )
 
     logger.info("Scheduler is running. Press Ctrl+C to stop.")

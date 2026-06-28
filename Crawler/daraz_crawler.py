@@ -1,21 +1,20 @@
-
 import logging
+import os
 import random
 import re
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from selenium import webdriver
+import undetected_chromedriver as uc
 from selenium.common.exceptions import (
     NoSuchElementException,
     StaleElementReferenceException,
     TimeoutException,
     WebDriverException,
 )
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -31,18 +30,25 @@ SELECTORS = {
     "card_link": "a",
     # Detail page: product title
     "title": "h1.pdp-mod-product-badge-title, span.pdp-name",
-    # Detail page: current selling price (may be discounted)
-    "current_price": "span.pdp-price_type_normal, span.notranslate.pdp-price",
-    # Detail page: original price (struck-through — indicates a discount)
+    # Detail page: current selling price
+    # pdp-price_size_xl added — Daraz NP storefront uses this class
+    "current_price": (
+        "span.pdp-price_type_normal, "
+        "span.notranslate.pdp-price, "
+        "span.pdp-price_size_xl"
+    ),
+    # Detail page: original / struck-through price
     "original_price": "span.pdp-price_type_deleted",
     # Detail page: seller name
     "seller": "a.seller-name__detail-name, span.seller-name__detail",
     # Detail page: product image (primary gallery image)
     "image": "div.gallery-preview-panel__content img, img.pdp-image",
-    # Detail page: item ID (in URL or meta)
+    # Detail page: item ID extracted from URL
     "item_id_pattern": r"-i(\d+)(?:-s\d+)?\.html",
     # Listing page: next page button
     "next_page": "li.ant-pagination-next:not(.ant-pagination-disabled) button",
+    # Anti-bot middleware overlay Daraz injects when it detects automation
+    "middleware_overlay": ".J_MIDDLEWARE_FRAME_WIDGET",
 }
 
 # Retry config
@@ -76,60 +82,82 @@ class DarazCrawler:
     """
     Crawls Daraz Nepal product listing pages and extracts price data.
 
+    Uses undetected-chromedriver to bypass Daraz's bot-detection middleware
+    (the J_MIDDLEWARE_FRAME_WIDGET overlay that blocks price extraction).
+
+    TWO MODES controlled by CRAWL_MODE env var:
+      discovery  — walk category listing pages, find new products, scrape them.
+                   Use this during Phase 1 (now → July 15) to build your basket.
+      tracking   — skip listing pages entirely, re-scrape already-known product
+                   URLs pulled from MongoDB. Use this during Phase 2 (July 15 →
+                   July 30) to build deep price history on the fixed basket.
+
     Usage:
-        crawler = DarazCrawler(delay_min=4, delay_max=10)
+        crawler = DarazCrawler(delay_min=10, delay_max=20)
         with crawler:
+            # Discovery mode
             products = crawler.crawl_category("laptops", max_products=50)
+            # Tracking mode
+            products = crawler.crawl_known_products(url_list, save_callback=cb)
     """
 
-    def __init__(self, delay_min: int = 4, delay_max: int = 10):
+    def __init__(self, delay_min: int = 10, delay_max: int = 20):
         self.delay_min = delay_min
         self.delay_max = delay_max
-        self.driver: Optional[webdriver.Chrome] = None
+        self.driver: Optional[uc.Chrome] = None
 
     # ──────────────────────────── Driver lifecycle ──────────────────────────────
 
-    def _build_driver(self) -> webdriver.Chrome:
-        opts = Options()
-        opts.add_argument("--headless=new")
+    def _build_driver(self) -> uc.Chrome:
+        """
+        Build a Chrome driver that bypasses Daraz's bot detection.
+
+        undetected-chromedriver patches navigator.webdriver, removes CDP
+        fingerprint signals, and handles all the masking that the manual
+        execute_cdp_cmd approach misses.
+
+        version_main: read from CHROME_VER env var (set by GitHub Actions
+        workflow after detecting the installed Chrome version). Falls back
+        to 149 for local Windows development. Pass version_main explicitly
+        so uc never guesses wrong and downloads a mismatched ChromeDriver.
+
+        CHROME_BINARY: optional path override for CI environments where
+        Chrome is installed to a non-standard location.
+        """
+        opts = uc.ChromeOptions()
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--disable-gpu")
         opts.add_argument("--window-size=1920,1080")
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-        opts.add_experimental_option("useAutomationExtension", False)
+
+        # Headless only in CI — non-headless is much harder for Daraz to detect
+        if os.getenv("CI") or os.getenv("GITHUB_ACTIONS"):
+            opts.add_argument("--headless=new")
+
+        # Allow CI to point uc at a specific Chrome binary
+        chrome_binary = os.getenv("CHROME_BINARY")
+        if chrome_binary:
+            opts.binary_location = chrome_binary
 
         ua = self._pick_user_agent()
         opts.add_argument(f"--user-agent={ua}")
 
-        service = Service()
-        driver = webdriver.Chrome(service=service, options=opts)
-
-        # Mask webdriver fingerprint
-        driver.execute_cdp_cmd(
-            "Page.addScriptToEvaluateOnNewDocument",
-            {
-                "source": """
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
-                    Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
-                """
-            },
-        )
+        # Read Chrome major version from env (set by Actions) or default to 149
+        version_main = int(os.getenv("CHROME_VER", "149"))
+        driver = uc.Chrome(options=opts, version_main=version_main)
         return driver
 
     def _pick_user_agent(self) -> str:
         agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.6167.184 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.122 Safari/537.36",
         ]
         return random.choice(agents)
 
     def __enter__(self):
-        logger.info("Starting Chrome driver...")
+        logger.info("Starting Chrome driver (undetected-chromedriver)...")
         self.driver = self._build_driver()
         return self
 
@@ -166,13 +194,62 @@ class DarazCrawler:
         except NoSuchElementException:
             return None
 
+    # ──────────────────────────── Overlay dismissal ─────────────────────────────
+
+    def _dismiss_overlay(self):
+        """
+        Dismiss Daraz's J_MIDDLEWARE_FRAME_WIDGET anti-bot overlay.
+
+        Strategy (in order):
+          1. Wait up to 5s for it to vanish on its own (sometimes it does)
+          2. JS removal — rip it from the DOM and unfreeze body scroll
+          3. Escape key fallback — catches standard modal patterns
+
+        Called before reading any price element and before any pagination click.
+        Safe to call even when no overlay is present.
+        """
+        # Step 1: give it a moment to self-dismiss
+        try:
+            WebDriverWait(self.driver, 5).until(
+                EC.invisibility_of_element_located(
+                    (By.CSS_SELECTOR, SELECTORS["middleware_overlay"])
+                )
+            )
+            return  # Gone — carry on
+        except TimeoutException:
+            pass
+
+        # Step 2: JS removal
+        try:
+            self.driver.execute_script("""
+                var overlay = document.querySelector('.J_MIDDLEWARE_FRAME_WIDGET');
+                if (overlay) {
+                    overlay.parentNode.removeChild(overlay);
+                }
+                // Daraz sets overflow:hidden on body when the overlay appears —
+                // restore it so the page is scrollable again.
+                document.body.style.overflow = '';
+                document.documentElement.style.overflow = '';
+            """)
+            time.sleep(0.5)
+            logger.debug("Middleware overlay removed via JS.")
+        except WebDriverException as e:
+            logger.debug(f"JS overlay removal failed: {e}")
+
+        # Step 3: Escape key
+        try:
+            self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+            time.sleep(0.5)
+        except WebDriverException:
+            pass
+
     # ──────────────────────────── Price parsing ─────────────────────────────────
 
     def _parse_price(self, raw: Optional[str]) -> Optional[float]:
         if not raw:
             return None
-        # Remove currency symbols and spaces first, THEN extract digits
-        # Strip "Rs.", "NPR", "रू" etc. before any regex
+        # Remove currency symbols and spaces, THEN extract digits
+        # Strips "Rs.", "NPR", "रू" etc.
         cleaned = re.sub(r"[^\d,]", "", raw).strip()
         if not cleaned:
             return None
@@ -195,11 +272,20 @@ class DarazCrawler:
     def _scrape_product_detail(self, url: str) -> Optional[dict]:
         """
         Visit a single Daraz product page and extract price fields.
-        Returns a dict or None on failure.
+
+        Flow:
+          1. Navigate to URL
+          2. Wait for title element (confirms page loaded)
+          3. Dismiss overlay BEFORE trying to read any price element
+          4. Extract all fields
+          5. Return dict or None on failure
         """
         try:
             self.driver.get(url)
             self._wait_for(SELECTORS["title"], timeout=20)
+
+            # Dismiss overlay before touching any price element
+            self._dismiss_overlay()
             self._polite_wait(extra=1.0)
 
             match = re.search(SELECTORS["item_id_pattern"], url)
@@ -213,13 +299,18 @@ class DarazCrawler:
             current_price  = self._parse_price(raw_current)
             original_price = self._parse_price(raw_original)
 
+            # Debug log — remove once selectors are confirmed stable
+            if not current_price:
+                logger.debug(
+                    f"Price debug — raw_current={raw_current!r}, "
+                    f"raw_original={raw_original!r}, url={url}"
+                )
+
             is_promotional = original_price is not None and (
                 original_price > (current_price or 0)
             )
 
             # ── Image extraction ─────────────────────────────────────────────
-            # Try src first (loaded image), fall back to data-src (lazy-loaded).
-            # image_verified=True only when we actually got a URL.
             image_url = None
             try:
                 img_el = self.driver.find_element(By.CSS_SELECTOR, SELECTORS["image"])
@@ -228,7 +319,6 @@ class DarazCrawler:
                     img_el.get_attribute("data-src") or
                     None
                 )
-                # Reject placeholder/blank src values
                 if image_url and (
                     image_url.startswith("data:") or image_url.strip() == ""
                 ):
@@ -264,7 +354,6 @@ class DarazCrawler:
         """
         Attempt to scrape a product page up to MAX_RETRIES times.
         Waits with backoff between attempts.
-        Returns the product dict if any attempt succeeds, else None.
         """
         for attempt in range(1, MAX_RETRIES + 1):
             result = self._scrape_product_detail(url)
@@ -285,7 +374,7 @@ class DarazCrawler:
 
         return None
 
-    # ──────────────────────────── Category listing ──────────────────────────────
+    # ──────────────────────────── Category listing (discovery) ──────────────────
 
     def _extract_links_from_current_page(self, links: list[str], max_products: int) -> None:
         """Read product cards currently in the DOM and append new links in-place."""
@@ -309,11 +398,15 @@ class DarazCrawler:
         Stops when max_products links are collected or no more pages exist.
 
         IMPORTANT: Daraz's listing page is a client-rendered SPA — pagination
-        state lives in JavaScript, not the URL. Re-navigating to `?page=N`
+        state lives in JavaScript, not the URL. Re-navigating to ?page=N
         with driver.get() just reloads page 1's content again, which silently
         caps every category at one page worth of products. We instead click
         the actual "Next" pagination button and wait for the old cards to go
         stale before reading the new ones.
+
+        The overlay is dismissed before every pagination click because the
+        middleware widget intercepts click events, causing
+        "Element click intercepted" WebDriverException.
         """
         links = []
         page = 1
@@ -322,6 +415,7 @@ class DarazCrawler:
         try:
             self.driver.get(listing_url)
             self._wait_for(SELECTORS["product_cards"], timeout=20)
+            self._dismiss_overlay()
             self._polite_wait()
         except TimeoutException:
             logger.warning(f"Timeout on listing page 1 for /{category}/, stopping category.")
@@ -343,7 +437,6 @@ class DarazCrawler:
             if len(links) >= max_products:
                 break
 
-            # Find the "Next" button — absence means we're on the last page.
             try:
                 next_btn = self.driver.find_element(By.CSS_SELECTOR, SELECTORS["next_page"])
             except NoSuchElementException:
@@ -355,6 +448,9 @@ class DarazCrawler:
                     "arguments[0].scrollIntoView({block: 'center'});", next_btn
                 )
                 self._polite_wait(extra=0.5)
+                # Dismiss overlay BEFORE clicking next — prevents
+                # "Element click intercepted" from the middleware widget
+                self._dismiss_overlay()
                 next_btn.click()
             except WebDriverException as e:
                 logger.warning(f"Click on next-page button failed: {e}")
@@ -362,8 +458,6 @@ class DarazCrawler:
 
             page += 1
 
-            # Wait for the page to actually change: the first card from the
-            # previous page should go stale once the SPA swaps in new content.
             try:
                 first_card_before = cards_before[0]
                 WebDriverWait(self.driver, 15).until(EC.staleness_of(first_card_before))
@@ -391,7 +485,10 @@ class DarazCrawler:
         save_callback=None,
     ) -> list[dict]:
         """
-        Full crawl of one Daraz category.
+        DISCOVERY MODE — full crawl of one Daraz category.
+
+        Walks listing pages to find new product URLs, then scrapes each one.
+        Use during Phase 1 (now → July 15) to populate your product basket.
 
         Args:
             category:      Daraz category slug (e.g. 'laptops')
@@ -402,7 +499,7 @@ class DarazCrawler:
 
         Returns a list of all successfully scraped product dicts.
         """
-        logger.info(f"=== Crawling category: {category} (max {max_products}) ===")
+        logger.info(f"=== [DISCOVERY] Crawling category: {category} (max {max_products}) ===")
         links = self._collect_product_links(category, max_products)
 
         results      = []
@@ -418,7 +515,6 @@ class DarazCrawler:
                 data["category"] = category
                 results.append(data)
 
-                # ── Immediate save: persist now, don't wait for batch ──────────
                 if save_callback:
                     try:
                         save_callback(data)
@@ -432,6 +528,66 @@ class DarazCrawler:
 
         logger.info(
             f"=== Category {category} done: "
+            f"{len(results)} scraped, {saved_count} saved immediately, "
+            f"{failed_count} failed after {MAX_RETRIES} retries ==="
+        )
+        return results
+
+    def crawl_known_products(
+        self,
+        products: list[dict],
+        save_callback=None,
+    ) -> list[dict]:
+        """
+        TRACKING MODE — re-scrape a pre-known list of products from MongoDB.
+
+        Skips listing page navigation entirely. Goes straight to each product
+        URL and records a fresh price snapshot. Use during Phase 2 (July 15 →
+        July 30) to build deep price history on the fixed basket.
+
+        Args:
+            products:      List of dicts with at least 'url' and 'category' keys.
+                           Pulled from MongoDB via storage.get_all_tracked_urls().
+            save_callback: Optional callable(product_dict) — same as crawl_category.
+
+        Returns a list of all successfully scraped product dicts.
+        """
+        logger.info(f"=== [TRACKING] Re-scraping {len(products)} known products ===")
+
+        results      = []
+        saved_count  = 0
+        failed_count = 0
+
+        for i, product in enumerate(products, 1):
+            url      = product.get("url")
+            category = product.get("category", "unknown")
+
+            if not url:
+                logger.warning(f"  [{i}] Skipping product with no URL: {product}")
+                failed_count += 1
+                continue
+
+            logger.info(f"  [{i}/{len(products)}] {url}")
+
+            data = self._scrape_with_retry(url)
+
+            if data:
+                data["category"] = category
+                results.append(data)
+
+                if save_callback:
+                    try:
+                        save_callback(data)
+                        saved_count += 1
+                    except Exception as e:
+                        logger.error(f"  Save callback failed for {url}: {e}")
+            else:
+                failed_count += 1
+
+            self._polite_wait()
+
+        logger.info(
+            f"=== Tracking run done: "
             f"{len(results)} scraped, {saved_count} saved immediately, "
             f"{failed_count} failed after {MAX_RETRIES} retries ==="
         )

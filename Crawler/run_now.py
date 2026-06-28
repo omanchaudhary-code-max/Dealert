@@ -1,10 +1,12 @@
-
 import argparse
 import logging
 import os
 import sys
+
 from dotenv import load_dotenv
+
 load_dotenv()
+
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -14,7 +16,10 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout),
     ],
 )
+
 from orchestrator import run_crawl
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run SPTDAS crawler immediately")
     parser.add_argument(
@@ -28,13 +33,18 @@ def main():
         help="Override MAX_PRODUCTS_PER_CATEGORY from .env",
     )
     args = parser.parse_args()
+
     if args.categories:
         os.environ["CATEGORIES"] = ",".join(args.categories)
         print(f"Override categories: {args.categories}")
+
     if args.max:
         os.environ["MAX_PRODUCTS_PER_CATEGORY"] = str(args.max)
         print(f"Override max products: {args.max}")
+
     success = run_crawl()
     sys.exit(0 if success else 1)
+
+
 if __name__ == "__main__":
     main()
